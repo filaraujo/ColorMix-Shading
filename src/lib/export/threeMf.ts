@@ -3,6 +3,7 @@ import JSZip from 'jszip';
 import type { MaterialRecipe, ParsedMesh } from '../../types/mesh';
 import { weldMesh } from '../mesh/weldMesh';
 import { sanitizeFileNameBase } from './download';
+import { buildOrcaProjectConfig, orcaSlotForMaterial, type OrcaTemplate } from './orcaProject';
 
 const MODEL_CONTENT_TYPE = 'application/vnd.ms-package.3dmanufacturing-3dmodel+xml';
 const START_PART_RELATIONSHIP = 'http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel';
@@ -10,7 +11,7 @@ const CORE_NAMESPACE = 'http://schemas.microsoft.com/3dmanufacturing/core/2015/0
 const PRUSA_NAMESPACE = 'http://schemas.slic3r.org/3mf/2017/06';
 const EXPORT_CHUNK_SIZE = 50_000;
 
-const yieldToBrowser = (): Promise<void> => new Promise((resolve) => window.setTimeout(resolve, 0));
+const yieldToBrowser = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 function escapeXml(value: string): string {
   return value
@@ -25,15 +26,24 @@ function normalizeHexColor(color: string): string {
   return hex.length >= 7 ? hex.slice(0, 7) : hex;
 }
 
+// TriangleSelector leaf encoding shared by PrusaSlicer and OrcaSlicer: two "no split" bits, then
+// the state in 2 bits, or "11" + a nibble of (state - 3). OrcaSlicer extends states >= 18 with a
+// 0b1111 nibble followed by a nibble of (state - 18).
 function encodePrusaTriangleState(state: number): string {
   const bitstream: boolean[] = [false, false];
-
-  if (state >= 3) {
-    bitstream.push(true, true);
-    const extendedState = state - 3;
+  const pushNibble = (value: number) => {
     for (let bitIndex = 0; bitIndex < 4; bitIndex += 1) {
-      bitstream.push(Boolean(extendedState & (1 << bitIndex)));
+      bitstream.push(Boolean(value & (1 << bitIndex)));
     }
+  };
+
+  if (state >= 18) {
+    bitstream.push(true, true);
+    pushNibble(0b1111);
+    pushNibble(state - 18);
+  } else if (state >= 3) {
+    bitstream.push(true, true);
+    pushNibble(state - 3);
   } else {
     bitstream.push(Boolean(state & 1), Boolean(state & 2));
   }
@@ -211,4 +221,73 @@ export async function exportMeshAsThreeMf(
   const { blob, fileName, materialCount } = await buildThreeMfBlob(mesh, assignments, materials);
   saveAs(blob, fileName);
   return { fileName, materialCount };
+}
+
+async function createOrcaModelXml(mesh: ParsedMesh, assignments: Uint8Array, slotForMaterial: number[], metadataXml: string): Promise<string> {
+  const welded = await weldMesh(mesh);
+  const encodedSlots = slotForMaterial.map(encodePrusaTriangleState);
+
+  const parts: string[] = [];
+  for (let chunkStart = 0; chunkStart < welded.vertices.length; chunkStart += EXPORT_CHUNK_SIZE) {
+    await yieldToBrowser();
+    const chunkEnd = Math.min(chunkStart + EXPORT_CHUNK_SIZE, welded.vertices.length);
+    for (let i = chunkStart; i < chunkEnd; i += 1) {
+      const [x, y, z] = welded.vertices[i];
+      parts.push(`<vertex x="${x}" y="${y}" z="${z}"/>`);
+    }
+  }
+  const verticesXml = parts.join('');
+
+  parts.length = 0;
+  for (let chunkStart = 0; chunkStart < welded.faces.length; chunkStart += EXPORT_CHUNK_SIZE) {
+    await yieldToBrowser();
+    const chunkEnd = Math.min(chunkStart + EXPORT_CHUNK_SIZE, welded.faces.length);
+    for (let i = chunkStart; i < chunkEnd; i += 1) {
+      const face = welded.faces[i];
+      const paint = encodedSlots[assignments[i] ?? 0] ?? encodedSlots[0];
+      parts.push(`<triangle v1="${face[0]}" v2="${face[1]}" v3="${face[2]}" paint_color="${paint}"/>`);
+    }
+  }
+  const trianglesXml = parts.join('');
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US" xmlns="${CORE_NAMESPACE}" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021">
+  ${metadataXml}
+  <resources>
+    <object id="1" type="model" name="${escapeXml(mesh.name)}">
+      <mesh>
+        <vertices>${verticesXml}</vertices>
+        <triangles>${trianglesXml}</triangles>
+      </mesh>
+    </object>
+  </resources>
+  <build>
+    <item objectid="1"/>
+  </build>
+</model>`;
+}
+
+/**
+ * Builds an OrcaSlicer (2.5+) project: the template's printer/process/filament settings, one
+ * mixed filament slot per ColorMix recipe, and the mesh painted with `paint_color`.
+ */
+export async function buildOrcaThreeMfBlob(
+  mesh: ParsedMesh,
+  assignments: Uint8Array,
+  materials: MaterialRecipe[],
+  template: OrcaTemplate,
+): Promise<{ blob: Blob; fileName: string; materialCount: number }> {
+  const config = buildOrcaProjectConfig(template, materials);
+  const slotForMaterial = orcaSlotForMaterial(materials, template.slotCount);
+  const fileName = `${sanitizeFileNameBase(mesh.originalFileName)}-ColorMixShading-Orca.3mf`;
+
+  const zip = new JSZip();
+  zip.file('[Content_Types].xml', createContentTypesXml());
+  zip.file('_rels/.rels', createRootRelationshipsXml());
+  zip.file('3D/3dmodel.model', await createOrcaModelXml(mesh, assignments, slotForMaterial, template.modelMetadataXml));
+  zip.file('Metadata/project_settings.config', JSON.stringify(config, null, 4));
+
+  const zipBlob = await zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE' });
+  const blob = new Blob([zipBlob], { type: 'model/3mf' });
+  return { blob, fileName, materialCount: materials.length };
 }

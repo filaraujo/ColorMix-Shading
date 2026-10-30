@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type PointerEvent } from 'react';
 import { saveAs } from 'file-saver';
-import { buildThreeMfBlob } from './lib/export/threeMf';
+import { buildOrcaThreeMfBlob, buildThreeMfBlob } from './lib/export/threeMf';
+import { readOrcaTemplate, type OrcaTemplate } from './lib/export/orcaProject';
 import {
   SlicerUploadAbortError,
   canOpenInPrusaslicer,
@@ -217,6 +218,7 @@ export default function App() {
   const [secondLightColor, setSecondLightColor] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [orcaTemplate, setOrcaTemplate] = useState<OrcaTemplate | null>(null);
   const [upload, setUpload] = useState<UploadState | null>(null);
   const showPrusaSlicerButton = useMemo(() => canOpenInPrusaslicer(), []);
   const [status, setStatus] = useState<string>('Ready for STL, OBJ, or 3MF import.');
@@ -383,6 +385,58 @@ export default function App() {
     });
     setStatus('Packaging 3MF...');
     return buildThreeMfBlob(originalMesh, assignments, materials);
+  };
+
+  const handleOrcaTemplateUpload = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) {
+      return;
+    }
+    setError(null);
+    try {
+      const template = await readOrcaTemplate(file, file.name);
+      setOrcaTemplate(template);
+      setStatus(`Using ${file.name} (OrcaSlicer ${template.version ?? '?'}, ${template.slotCount} filaments) as the Orca project.`);
+    } catch (caughtError) {
+      setOrcaTemplate(null);
+      setError(caughtError instanceof Error ? caughtError.message : 'Could not read the OrcaSlicer project.');
+    }
+  };
+
+  const handleOrcaExport = async () => {
+    if (!originalMesh || !orcaTemplate) {
+      return;
+    }
+
+    setIsProcessing(true);
+    setIsExporting(true);
+    setError(null);
+    setStatus('Computing material assignments...');
+
+    try {
+      const { assignments, materials } = await computeAssignments(originalMesh, {
+        mode,
+        lightDirection,
+        axis,
+        materialCount,
+        palette,
+        secondLight:
+          secondLightColor !== null
+            ? { direction: secondLightDirection, color: secondLightColor }
+            : null,
+      });
+      setStatus('Packaging OrcaSlicer project...');
+      const result = await buildOrcaThreeMfBlob(originalMesh, assignments, materials, orcaTemplate);
+      saveAs(result.blob, result.fileName);
+      setStatus(`Exported ${result.fileName} for OrcaSlicer.`);
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'OrcaSlicer export failed.');
+      setStatus('Export failed.');
+    } finally {
+      setIsProcessing(false);
+      setIsExporting(false);
+    }
   };
 
   const handleExport = async () => {
@@ -733,6 +787,26 @@ export default function App() {
             </button>
           ) : null}
           <p className="helper-copy">Face material indices follow the palette order shown above.</p>
+        </section>
+
+        <section className="panel-section">
+          <h2>OrcaSlicer</h2>
+          <p className="helper-copy">
+            Needs OrcaSlicer 2.5 or newer. In Orca, set up your printer with the physical filaments, save an empty
+            project, and choose it here. Its settings are kept; one mixed filament is added per shade.
+          </p>
+          <label className="file-drop">
+            <input type="file" accept=".3mf" onChange={handleOrcaTemplateUpload} disabled={isProcessing} />
+            <span>{orcaTemplate ? `Project: ${orcaTemplate.fileName}` : 'Choose an OrcaSlicer project (.3mf)'}</span>
+          </label>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={handleOrcaExport}
+            disabled={!originalMesh || !orcaTemplate || isProcessing || upload !== null}
+          >
+            {isExporting ? 'Exporting...' : 'Export for OrcaSlicer'}
+          </button>
         </section>
       </aside>
 
